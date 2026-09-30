@@ -201,6 +201,35 @@ function onCaptureNavigation(details) {
   }
 }
 
+function decodePostDataEntries(entries) {
+  const chunks = entries.filter((e) => typeof e?.bytes === 'string').map((e) => {
+    const bin = atob(e.bytes)
+    const arr = new Uint8Array(bin.length)
+    for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i)
+    return arr
+  })
+  if (!chunks.length) return null
+  const all = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0))
+  let off = 0
+  for (const c of chunks) { all.set(c, off); off += c.length }
+  return new TextDecoder().decode(all)
+}
+
+// Large/binary bodies arrive without postData; recover from entries or Network.getRequestPostData.
+function recoverRequestBody(entry, request, source, requestId) {
+  try {
+    if (Array.isArray(request.postDataEntries) && request.postDataEntries.length) {
+      const body = decodePostDataEntries(request.postDataEntries)
+      if (body !== null) { entry.requestBody = body; return }
+    }
+    const debuggee = source.sessionId ? { tabId: source.tabId, sessionId: source.sessionId } : { tabId: source.tabId }
+    // finalizeEntry waits on this before publishing.
+    entry._bodyRecovery = Promise.resolve(chrome.debugger.sendCommand(debuggee, 'Network.getRequestPostData', { requestId }))
+      .then((result) => { if (result?.postData) entry.requestBody = result.postData })
+      .catch(() => { /* leave requestBody null */ })
+  } catch { /* leave requestBody null */ }
+}
+
 // Chrome Debugger Protocol events
 function handleDebuggerEvent(source, method, params) {
   if (!captureActive) return
@@ -241,7 +270,7 @@ function handleDebuggerEvent(source, method, params) {
       prev.timestamp = cdpTimestampToEpochMs(prev._startTimestamp)
       delete prev._startTimestamp
       delete prev._requestId
-      pushToServer({ type: 'capture_event', kind: 'network', data: prev })
+      pushNetworkEntry(prev)
     } else if (capturePending.has(key)) {
       // requestId collision: this tabId:requestId key already holds an
       // unfinalized entry from an earlier, unrelated request (CDP requestIds
@@ -279,6 +308,9 @@ function handleDebuggerEvent(source, method, params) {
       duration: null,
       error: null,
     })
+    if (request.hasPostData && !request.postData) {
+      recoverRequestBody(capturePending.get(key), request, source, params.requestId)
+    }
   }
 
   if (method === 'Network.responseReceived') {
@@ -440,6 +472,19 @@ function handleDebuggerEvent(source, method, params) {
 
 function finalizeEntry(key, entry) {
   capturePending.delete(key)
+  publishEntry(entry)
+}
+
+// Push a network entry once any in-flight request-body recovery settles.
+function pushNetworkEntry(entry) {
+  const recovery = entry._bodyRecovery
+  delete entry._bodyRecovery
+  const push = () => pushToServer({ type: 'capture_event', kind: 'network', data: entry })
+  if (recovery) recovery.then(push)
+  else push()
+}
+
+function publishEntry(entry) {
   // Convert _startTimestamp (CDP monotonic) to wall-clock epoch ms
   const timestamp = cdpTimestampToEpochMs(entry._startTimestamp)
   const requestId = entry._requestId
@@ -452,7 +497,7 @@ function finalizeEntry(key, entry) {
   entry.timestamp = timestamp
 
   // Stream to server immediately — no local buffering
-  pushToServer({ type: 'capture_event', kind: 'network', data: entry })
+  pushNetworkEntry(entry)
 }
 
 // ─── DOM + storage snapshots ───────────────────────────────────────────────
@@ -1449,6 +1494,7 @@ export async function executeCommand(command) {
           delete entry._startTimestamp
           delete entry._requestId
           entry.responseBody = entry.responseBody || '[incomplete — capture stopped]'
+          delete entry._bodyRecovery // don't wait: capture_done follows immediately
           pushToServer({ type: 'capture_event', kind: 'network', data: entry })
         }
         capturePending.clear()
