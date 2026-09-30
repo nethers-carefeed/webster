@@ -149,4 +149,45 @@ describe('capture request bodies for POSTs', () => {
     expect(ev.requestBody).toBe('redirected-body')
     expect('_bodyRecovery' in ev).toBe(false)
   })
+
+  describe('stopping while a body lookup is in flight', () => {
+    async function startAndSendPost() {
+      await executeCommand({ action: 'startCapture' } as any)
+      const source = { tabId: 7 }
+      onEvent!(source, 'Network.requestWillBeSent', {
+        requestId: 'req-1', type: 'XHR', timestamp: 100,
+        request: { url: 'https://app.example.com/api/save', method: 'POST', headers: {}, hasPostData: true },
+      })
+      onEvent!(source, 'Network.responseReceived', {
+        requestId: 'req-1', response: { status: 200, headers: {}, mimeType: 'application/json' },
+      })
+      onEvent!(source, 'Network.loadingFinished', { requestId: 'req-1', timestamp: 100.5 })
+      await new Promise(r => setTimeout(r, 10)) // entry is finalized, now waiting on the lookup
+    }
+    const doneIndex = () => pushed.findIndex(m => m.type === 'capture_done')
+    const networkIndex = () => pushed.findIndex(m => m.kind === 'network')
+
+    test('pushes the finished entry, with its body, before capture_done', async () => {
+      postDataImpl = async () => { await new Promise(r => setTimeout(r, 60)); return { postData: '{"late":true}' } }
+      await startAndSendPost()
+      expect(pushed.some(m => m.kind === 'network')).toBe(false) // still waiting on the lookup
+      await executeCommand({ action: 'stopCapture' } as any)
+      expect(networkIndex()).toBeGreaterThanOrEqual(0)
+      expect(networkIndex()).toBeLessThan(doneIndex())
+      expect(pushed[networkIndex()].data.requestBody).toBe('{"late":true}')
+    })
+
+    test('stop stays bounded when the lookup hangs, and the stale entry never reaches a newer capture', async () => {
+      postDataImpl = () => new Promise(r => setTimeout(() => r({ postData: 'too-late' }), 900))
+      await startAndSendPost()
+      const t0 = Date.now()
+      await executeCommand({ action: 'stopCapture' } as any)
+      expect(Date.now() - t0).toBeLessThan(800)
+      expect(doneIndex()).toBeGreaterThanOrEqual(0)
+      await executeCommand({ action: 'startCapture' } as any) // a newer capture begins
+      await new Promise(r => setTimeout(r, 500)) // the old lookup now settles
+      expect(pushed.some(m => m.kind === 'network')).toBe(false)
+      await executeCommand({ action: 'stopCapture' } as any)
+    })
+  })
 })

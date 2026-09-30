@@ -16,6 +16,10 @@ const MAX_NETWORK_LOG = 500
 // does NOT buffer capture data. This makes capture resilient to SW restarts.
 let captureActive = false
 let capturePending = new Map()   // requestId -> partial entry (waiting for response body)
+let captureGeneration = 0        // bumped per start_capture; stale async pushes from an earlier capture are discarded
+const inFlightBodyRecoveries = new Set() // request-body lookups still running; stop_capture waits (bounded) on these
+const BODY_RECOVERY_TIMEOUT_MS = 5000    // cap on a single Network.getRequestPostData call
+const STOP_RECOVERY_WAIT_MS = 500        // how long stop_capture waits for in-flight lookups
 let capturedTabs = new Set()     // tabIds with debugger attached
 let capturedTabUrls = new Map()  // tabId -> URL at attach time (for detach reporting; kept in lockstep with capturedTabs)
 let captureUrlFilter = null      // only capture URLs containing this string
@@ -224,9 +228,15 @@ function recoverRequestBody(entry, request, source, requestId) {
     }
     const debuggee = source.sessionId ? { tabId: source.tabId, sessionId: source.sessionId } : { tabId: source.tabId }
     // finalizeEntry waits on this before publishing.
-    entry._bodyRecovery = Promise.resolve(chrome.debugger.sendCommand(debuggee, 'Network.getRequestPostData', { requestId }))
+    const lookup = Promise.resolve(chrome.debugger.sendCommand(debuggee, 'Network.getRequestPostData', { requestId }))
+    let timer
+    const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('timeout')), BODY_RECOVERY_TIMEOUT_MS) })
+    const recovery = Promise.race([lookup, timeout])
       .then((result) => { if (result?.postData) entry.requestBody = result.postData })
       .catch(() => { /* leave requestBody null */ })
+      .finally(() => { clearTimeout(timer); inFlightBodyRecoveries.delete(recovery) })
+    inFlightBodyRecoveries.add(recovery)
+    entry._bodyRecovery = recovery
   } catch { /* leave requestBody null */ }
 }
 
@@ -479,7 +489,9 @@ function finalizeEntry(key, entry) {
 function pushNetworkEntry(entry) {
   const recovery = entry._bodyRecovery
   delete entry._bodyRecovery
-  const push = () => pushToServer({ type: 'capture_event', kind: 'network', data: entry })
+  const generation = captureGeneration
+  // A recovery that settles after a newer capture began must not leak into it.
+  const push = () => { if (generation === captureGeneration) pushToServer({ type: 'capture_event', kind: 'network', data: entry }) }
   if (recovery) recovery.then(push)
   else push()
 }
@@ -1330,6 +1342,7 @@ export async function executeCommand(command) {
         }
 
         captureActive = true
+        captureGeneration++
         capturePending = new Map()
         capturedTabs = new Set()
         capturedTabUrls = new Map()
@@ -1484,6 +1497,19 @@ export async function executeCommand(command) {
             ))
             captureCursorShown = false
           }
+        }
+
+        // Let in-flight request-body lookups settle (bounded) so finished entries
+        // waiting on one are pushed BEFORE capture_done — the server drops
+        // events that arrive after it. Entries still in capturePending pick up
+        // their recovered body in the flush below.
+        if (inFlightBodyRecoveries.size) {
+          let timer
+          await Promise.race([
+            Promise.allSettled([...inFlightBodyRecoveries]),
+            new Promise((resolve) => { timer = setTimeout(resolve, STOP_RECOVERY_WAIT_MS) }),
+          ])
+          clearTimeout(timer)
         }
 
         // Flush remaining pending entries (incomplete requests) to server
